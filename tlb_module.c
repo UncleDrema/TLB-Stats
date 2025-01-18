@@ -5,7 +5,7 @@
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 
-#define MAX_PROCESSES 10
+#define MAX_PROCESSES 128
 
 static struct perf_event *tlb_events[MAX_PROCESSES];
 static struct perf_event_attr tlb_event_attr;
@@ -23,13 +23,15 @@ static void read_counter(struct timer_list *t)
     struct task_struct *task;
     int i = 0;
 
+    u64 enabled, running;
+
     for_each_process(task) {
         if (i >= MAX_PROCESSES)
             break;
 
         if (tlb_events[i]) {
-            u64 count = perf_event_read_value(tlb_events[i], NULL, NULL);
-            printk(KERN_INFO "+[TLB] Process: %s (PID: %d), DTLB misses: %llu\n", task->comm, task->pid, count);
+            u64 count = perf_event_read_value(tlb_events[i], &enabled, &running);
+            printk(KERN_INFO "+[TLB] Process: %s (PID: %d), DTLB misses: %llu, enabled: %llu, running: %llu\n", task->comm, task->pid, count, enabled, running);
         }
         i++;
     }
@@ -88,6 +90,8 @@ static void __exit dtlb_miss_stats_exit(void) {
     }
 
     del_timer(&read_timer);
+
+    printk(KERN_INFO "+[TLB] module unloaded.\n");
 }
 
 module_init(dtlb_miss_stats_init);
