@@ -23,4 +23,4 @@ remove:
 	sudo rmmod tlb_module
 
 watch:
-	sudo dmesg -w | grep "+\[TLB\]"
+	sudo dmesg -w | grep "\[TLB\]"

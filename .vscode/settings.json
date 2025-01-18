@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "list.h": "c",
+        "container_of.h": "c",
+        "ktime.h": "c",
+        "jiffies.h": "c",
+        "signal.h": "c",
+        "sched.h": "c",
+        "timer.h": "c"
+    }
+}
