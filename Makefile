@@ -2,7 +2,7 @@
 
 # If KERNELRELEASE is defined, we've been invoked from the kernel build system
 ifneq ($(KERNELRELEASE),)
-	obj-m := tlb_module.o
+	obj-m := tlb_stats.o
 
 # Otherwise we were called directly from the command line
 else
@@ -17,10 +17,10 @@ clean:
 
 endif
 insert:
-	sudo insmod tlb_module.ko
+	sudo insmod tlb_stats.ko
 
 remove:
-	sudo rmmod tlb_module
+	sudo rmmod tlb_stats
 
 watch:
 	sudo dmesg -w | grep "\[TLB\]"

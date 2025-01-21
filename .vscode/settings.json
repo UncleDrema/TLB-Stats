@@ -6,6 +6,7 @@
         "jiffies.h": "c",
         "signal.h": "c",
         "sched.h": "c",
-        "timer.h": "c"
+        "timer.h": "c",
+        "module.h": "c"
     }
 }
