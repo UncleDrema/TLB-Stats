@@ -11,20 +11,22 @@
 #include <linux/seq_file.h>
 #include <linux/string.h>
 
+#define INTERVAL_SECONDS 1
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("UncleDrema");
 MODULE_DESCRIPTION("Kernel module to collect DTLB misses for processes.");
 
 static struct work_struct update_statistics_work;
-static struct perf_event_attr dtlb_read_pea;
-static struct perf_event_attr dtlb_write_pea;
+static struct perf_event_attr dtlb_read_miss_pea;
+static struct perf_event_attr dtlb_read_access_pea;
 static struct timer_list read_timer;
 static struct proc_dir_entry *tlbmiss_dir;
 
 /* Each finalized 1-second interval. */
 struct dtlb_interval {
     u64 dtlb_read_misses;
-    u64 dtlb_write_misses;
+    u64 dtlb_read_accesses;
     u64 enabled;
     u64 running;
     struct list_head list;
@@ -33,8 +35,8 @@ struct dtlb_interval {
 /* Holds per-process tracking data. */
 struct dtlb_proc_info {
     struct task_struct *task;
-    struct perf_event *dtlb_read_ev;
-    struct perf_event *dtlb_write_ev;
+    struct perf_event *dtlb_read_miss_ev;
+    struct perf_event *dtlb_read_access_ev;
 
     struct list_head interval_list;
     struct list_head list;
@@ -49,7 +51,7 @@ static struct kmem_cache *dtlb_proc_cache;
 static struct kmem_cache *dtlb_interval_cache;
 
 /* Unused, but function prototype required by perf_event_create_kernel_counter. */
-static void dtlb_miss_handler(struct perf_event *dtlb_read_ev,
+static void dtlb_miss_handler(struct perf_event *dtlb_read_miss_ev,
                               struct perf_sample_data *data,
                               struct pt_regs *regs)
 { }
@@ -69,41 +71,42 @@ static int dtlb_proc_show(struct seq_file *m, void *v)
 {
     struct dtlb_proc_info *info = m->private;
     struct dtlb_interval *intrv;
-    u64 total_dtlb_read_misses = 0, total_dtlb_write_misses = 0,
-        max_dtlb_read_misses = 0, max_dtlb_write_misses = 0,
+    u64 total_dtlb_read_misses = 0, total_dtlb_read_accesses = 0, total_dtlb_read_hits = 0,
+        max_dtlb_read_misses = 0, max_dtlb_read_accesses = 0, max_dtlb_read_hits = 0,
         total_enabled, total_running, min_enabled = ULLONG_MAX, min_running = ULLONG_MAX, max_enabled = 0, max_running = 0;
     size_t count_intervals = 0,
-           count_dtlb_read_nonzero = 0, count_dtlb_write_nonzero = 0;
+           count_dtlb_read_miss_nonzero = 0, count_dtlb_read_access_nonzero = 0, count_dtlb_read_hits_nonzero;
 
-    u64 dtlb_read_prev, dtlb_write_prev, enabled_prev, running_prev;
-    u64 dtlb_read_diff, dtlb_write_diff, enabled_diff, running_diff;
+    u64 dtlb_read_miss_prev, dtlb_read_access_prev, enabled_prev, running_prev;
+    u64 dtlb_read_miss_diff, dtlb_read_access_diff, dtlb_read_hits_diff, enabled_diff, running_diff;
     
     list_for_each_entry(intrv, &info->interval_list, list) {
         if (count_intervals == 0)
         {
-            dtlb_read_prev = intrv->dtlb_read_misses;
-            dtlb_write_prev = intrv->dtlb_write_misses;
+            dtlb_read_miss_prev = intrv->dtlb_read_misses;
+            dtlb_read_access_prev = intrv->dtlb_read_accesses;
             enabled_prev = intrv->enabled;
             running_prev = intrv->running;
 
-            dtlb_read_diff = dtlb_read_prev;
-            dtlb_write_diff = dtlb_write_prev;
+            dtlb_read_miss_diff = dtlb_read_miss_prev;
+            dtlb_read_access_diff = dtlb_read_access_prev;
             enabled_diff = enabled_prev;
             running_diff = running_prev;
             
         }
         else
         {
-            dtlb_read_diff = intrv->dtlb_read_misses - dtlb_read_prev;
-            dtlb_write_diff = intrv->dtlb_write_misses - dtlb_write_prev;
+            dtlb_read_miss_diff = intrv->dtlb_read_misses - dtlb_read_miss_prev;
+            dtlb_read_access_diff = intrv->dtlb_read_accesses - dtlb_read_access_prev;
             enabled_diff = intrv->enabled - enabled_prev;
             running_diff = intrv->running - running_prev;
 
-            dtlb_read_prev = intrv->dtlb_read_misses;
-            dtlb_write_prev = intrv->dtlb_write_misses;
+            dtlb_read_miss_prev = intrv->dtlb_read_misses;
+            dtlb_read_access_prev = intrv->dtlb_read_accesses;
             enabled_prev = intrv->enabled;
             running_prev = intrv->running;
         }
+        dtlb_read_hits_diff = dtlb_read_access_diff - dtlb_read_miss_diff;
 
         count_intervals++;
 
@@ -120,64 +123,89 @@ static int dtlb_proc_show(struct seq_file *m, void *v)
         if (running_prev > max_running)
             max_running = running_prev;
 
-        if (dtlb_read_diff > 0) {
-            total_dtlb_read_misses += dtlb_read_diff;
-            count_dtlb_read_nonzero++;
-            if (dtlb_read_diff > max_dtlb_read_misses)
-                max_dtlb_read_misses = dtlb_read_diff;
+        if (dtlb_read_hits_diff > 0) {
+            total_dtlb_read_hits += dtlb_read_hits_diff;
+            count_dtlb_read_hits_nonzero++;
+            if (dtlb_read_hits_diff > max_dtlb_read_hits)
+                max_dtlb_read_hits = dtlb_read_hits_diff;
         }
 
-        if (dtlb_write_diff > 0) {
-            total_dtlb_write_misses += dtlb_write_diff;
-            count_dtlb_write_nonzero++;
-            if (dtlb_write_diff > max_dtlb_write_misses)
-                max_dtlb_write_misses = dtlb_write_diff;
+        if (dtlb_read_miss_diff > 0) {
+            total_dtlb_read_misses += dtlb_read_miss_diff;
+            count_dtlb_read_miss_nonzero++;
+            if (dtlb_read_miss_diff > max_dtlb_read_misses)
+                max_dtlb_read_misses = dtlb_read_miss_diff;
+        }
+
+        if (dtlb_read_access_diff > 0) {
+            total_dtlb_read_accesses += dtlb_read_access_diff;
+            count_dtlb_read_access_nonzero++;
+            if (dtlb_read_access_diff > max_dtlb_read_accesses)
+                max_dtlb_read_accesses = dtlb_read_access_diff;
         }
     }
 
-    seq_printf(m, "Process: %s (PID %d)\n", info->comm, task_pid_nr(info->task));
-    seq_printf(m, "Intervals recorded: %zu\n", count_intervals);
+    seq_printf(m, "Процесс: %s (PID %d)\n", info->comm, task_pid_nr(info->task));
+    seq_printf(m, "Записано интервалов: %zu, длительность каждого интервала: %d сек.\n", count_intervals, INTERVAL_SECONDS);
 
     if (count_intervals == 0) {
-        seq_printf(m, "No intervals recorded.\n");
+        seq_printf(m, "Ни один интервал еще не записан.\n");
         return 0;
     }
 
-    seq_printf(m, "DTLB read misses: %llu\n", (unsigned long long)total_dtlb_read_misses);
-    seq_printf(m, "DTLB write misses: %llu\n", (unsigned long long)total_dtlb_write_misses);
+    seq_printf(m, "обращений к DTLB: %llu\n", (unsigned long long)total_dtlb_read_accesses);
+    seq_printf(m, "Промахов в DTLB: %llu\n", (unsigned long long)total_dtlb_read_misses);
+    seq_printf(m, "Попаданий в DTLB: %llu\n", (unsigned long long)total_dtlb_read_hits);
+    
+    u64 hitrate = 0;
+    if (total_dtlb_read_accesses > 0)
+        hitrate = total_dtlb_read_hits * 100 / total_dtlb_read_accesses;
+    seq_printf(m, "Процент попаданий в DTLB: %llu%%\n", (unsigned long long)hitrate);
 
-    seq_printf(m, "avg(DTLB read) = %llu misses/sec\n",
+    seq_printf(m, "Среднее число обращений к DTLB = %llu/сек.\n",
+                (unsigned long long)(total_dtlb_read_accesses / count_intervals));
+
+    seq_printf(m, "Среднее число промахов в DTLB = %llu/сек.\n",
                (unsigned long long)(total_dtlb_read_misses / count_intervals));
-    seq_printf(m, "avg(DTLB write) = %llu misses/sec\n",
-                (unsigned long long)(total_dtlb_write_misses / count_intervals));
 
-    if (count_dtlb_read_nonzero > 0) {
-        u64 avg_dtlb_read_nonzero = total_dtlb_read_misses / count_dtlb_read_nonzero;
-        seq_printf(m, "avg(DTLB read-0) = %llu misses/sec (intervals with misses)\n",
-                   (unsigned long long)avg_dtlb_read_nonzero);
-    } else {
-        seq_printf(m, "avg(DTLB read-0) = 0 (no intervals with misses)\n");
-    }
+    seq_printf(m, "Среднее число попаданий в DTLB = %llu/сек.\n",
+                (unsigned long long)(total_dtlb_read_hits / count_intervals));
 
-    if (count_dtlb_write_nonzero > 0) {
-        u64 avg_dtlb_write_nonzero = total_dtlb_write_misses / count_dtlb_write_nonzero;
-        seq_printf(m, "avg(DTLB write-0) = %llu misses/sec (intervals with misses)\n",
+    if (count_dtlb_read_access_nonzero > 0) {
+        u64 avg_dtlb_write_nonzero = total_dtlb_read_accesses / count_dtlb_read_access_nonzero;
+        seq_printf(m, "Среднее число обращений к DTLB = %llu/сек. (среди интервалов, в течение которых были события)\n",
                    (unsigned long long)avg_dtlb_write_nonzero);
     } else {
-        seq_printf(m, "avg(DTLB write-0) = 0 (no intervals with misses)\n");
+        seq_printf(m, "Не случилось ни одной попытки чтения\n");
     }
 
-    seq_printf(m, "peak(DTLB read)  = %llu misses in a single interval\n",
-               (unsigned long long)max_dtlb_read_misses);
-    seq_printf(m, "peak(DTLB write)  = %llu misses in a single interval\n",
-                (unsigned long long)max_dtlb_write_misses);
+    if (count_dtlb_read_miss_nonzero > 0) {
+        u64 avg_dtlb_read_nonzero = total_dtlb_read_misses / count_dtlb_read_miss_nonzero;
+        seq_printf(m, "Среднее число промахов в DTLB = %llu/сек. (среди интервалов, в течение которых были события)\n",
+                   (unsigned long long)avg_dtlb_read_nonzero);
+    } else {
+        seq_printf(m, "Не случилось ни одного промаха\n");
+    }
 
+    if (count_dtlb_read_hits_nonzero > 0) {
+        u64 avg_dtlb_read_hits_nonzero = total_dtlb_read_hits / count_dtlb_read_hits_nonzero;
+        seq_printf(m, "Среднее число попаданий в DTLB = %llu/сек. (среди интервалов, в течение которых были события)\n",
+                   (unsigned long long)avg_dtlb_read_hits_nonzero);
+    } else {
+        seq_printf(m, "Не случилось ни одного попадания\n");
+    }
+
+    seq_printf(m, "Максимальное число промахов = %llu за один интервал\n",
+               (unsigned long long)max_dtlb_read_misses);
+
+    /*
     seq_printf(m, "avg_enabled  = %llu\n", (unsigned long long)(total_enabled / count_intervals));
     seq_printf(m, "avg_running  = %llu\n", (unsigned long long)(total_running / count_intervals));
     seq_printf(m, "min_enabled  = %llu\n", (unsigned long long)min_enabled);
     seq_printf(m, "min_running  = %llu\n", (unsigned long long)min_running);
     seq_printf(m, "max_enabled  = %llu\n", (unsigned long long)max_enabled);
     seq_printf(m, "max_running  = %llu\n", (unsigned long long)max_running);
+    */
     
     return 0;
 }
@@ -200,10 +228,10 @@ static void remove_process_info(struct dtlb_proc_info *info)
     struct dtlb_interval *intrv, *tmp;
     list_del(&info->list);
 
-    if (info->dtlb_read_ev)
-        perf_event_release_kernel(info->dtlb_read_ev);
-    if (info->dtlb_write_ev)
-        perf_event_release_kernel(info->dtlb_write_ev);
+    if (info->dtlb_read_miss_ev)
+        perf_event_release_kernel(info->dtlb_read_miss_ev);
+    if (info->dtlb_read_access_ev)
+        perf_event_release_kernel(info->dtlb_read_access_ev);
 
     if (info->proc_file) {
         remove_proc_entry(info->proc_entry_name, tlbmiss_dir);
@@ -221,36 +249,39 @@ static void remove_process_info(struct dtlb_proc_info *info)
 static struct dtlb_proc_info* create_process_info(struct task_struct *task)
 {
     struct dtlb_proc_info *info;
-    struct perf_event *dtlb_read_ev, *dtlb_write_ev;
+    struct perf_event *dtlb_read_miss_ev, *dtlb_read_access_ev;
     char name[16];
 
-    dtlb_read_ev = perf_event_create_kernel_counter(&dtlb_read_pea, -1, task,
+    dtlb_read_miss_ev = perf_event_create_kernel_counter(&dtlb_read_miss_pea, -1, task,
                                            dtlb_miss_handler, NULL);
-    if (IS_ERR(dtlb_read_ev))
+    if (IS_ERR(dtlb_read_miss_ev))
     {
-        printk(KERN_ERR "[TLB] Failed to create perf_event for DTLB read misses: %ld\n", PTR_ERR(dtlb_read_ev));
+        printk(KERN_ERR "[TLB] Failed to create perf_event for DTLB read misses: %ld\n", PTR_ERR(dtlb_read_miss_ev));
         return NULL;
     }
 
     
-    dtlb_write_ev = perf_event_create_kernel_counter(&dtlb_write_pea, -1, task,
+    dtlb_read_access_ev = perf_event_create_kernel_counter(&dtlb_read_access_pea, -1, task,
                                            dtlb_miss_handler, NULL);
-    if (IS_ERR(dtlb_write_ev))
+    if (IS_ERR(dtlb_read_access_ev))
     {
-        printk(KERN_ERR "[TLB] Failed to create perf_event for DTLB write misses: %ld\n", PTR_ERR(dtlb_write_ev));
-        perf_event_release_kernel(dtlb_read_ev);
+        printk(KERN_ERR "[TLB] Failed to create perf_event for DTLB write misses: %ld\n", PTR_ERR(dtlb_read_access_ev));
+        perf_event_release_kernel(dtlb_read_miss_ev);
         return NULL;
     }
 
     info = kmem_cache_alloc(dtlb_proc_cache, GFP_KERNEL);
     if (!info) {
-        perf_event_release_kernel(dtlb_read_ev);
-        perf_event_release_kernel(dtlb_write_ev);
+        perf_event_release_kernel(dtlb_read_miss_ev);
+        perf_event_release_kernel(dtlb_read_access_ev);
         return NULL;
     }
     
     info->task = task;
-    info->dtlb_read_ev = dtlb_read_ev;
+    info->dtlb_read_miss_ev = dtlb_read_miss_ev;
+    info->dtlb_read_access_ev = dtlb_read_access_ev;
+    printk(KERN_INFO "[TLB] Created perf_event for PID %d, read pointer: %p\n", task_pid_nr(task), dtlb_read_miss_ev);
+    printk(KERN_INFO "[TLB] Created perf_event for PID %d, write pointer: %p\n", task_pid_nr(task), dtlb_read_access_ev);
     INIT_LIST_HEAD(&info->interval_list);
     get_task_comm(info->comm, task);
 
@@ -264,8 +295,8 @@ static struct dtlb_proc_info* create_process_info(struct task_struct *task)
                                        info);
     if (!info->proc_file) {
         kmem_cache_free(dtlb_proc_cache, info);
-        perf_event_release_kernel(dtlb_read_ev);
-        perf_event_release_kernel(dtlb_write_ev);
+        perf_event_release_kernel(dtlb_read_miss_ev);
+        perf_event_release_kernel(dtlb_read_access_ev);
         return NULL;
     }
     return info;
@@ -293,7 +324,7 @@ static void remove_finished_processes(void)
 }
 
 static void add_interval(struct dtlb_proc_info *info,
-                         u64 dtlb_read_misses, u64 dtlb_write_misses,
+                         u64 dtlb_read_misses, u64 dtlb_read_accesses,
                          u64 itlb_read_misses, u64 itlb_write_misses,
                          u64 enabled, u64 running)
 {
@@ -307,7 +338,7 @@ static void add_interval(struct dtlb_proc_info *info,
         return;
 
     interval->dtlb_read_misses = dtlb_read_misses;
-    interval->dtlb_write_misses = dtlb_write_misses;
+    interval->dtlb_read_accesses = dtlb_read_accesses;
     interval->enabled = enabled;
     interval->running = running;
 
@@ -317,15 +348,15 @@ static void add_interval(struct dtlb_proc_info *info,
 static void update_process_intervals(void)
 {
     struct dtlb_proc_info *info;
-    u64 enabled, running, dtlb_read_misses, dtlb_write_misses, itlb_read_misses, itlb_write_misses;
+    u64 enabled, running, dtlb_read_misses, dtlb_read_accesses, itlb_read_misses, itlb_write_misses;
     list_for_each_entry(info, &dtlb_process_list, list) {
-        if (!info->dtlb_read_ev)
+        if (!info->dtlb_read_miss_ev)
             continue;
 
-        dtlb_read_misses = info->dtlb_read_ev ? perf_event_read_value(info->dtlb_read_ev, &enabled, &running) : 0;
-        dtlb_write_misses = info->dtlb_write_ev ? perf_event_read_value(info->dtlb_write_ev, &enabled, &running) : 0;
+        dtlb_read_misses = info->dtlb_read_miss_ev ? perf_event_read_value(info->dtlb_read_miss_ev, &enabled, &running) : 0;
+        dtlb_read_accesses = info->dtlb_read_access_ev ? perf_event_read_value(info->dtlb_read_access_ev, &enabled, &running) : 0;
 
-        add_interval(info, dtlb_read_misses, dtlb_write_misses, itlb_read_misses, itlb_write_misses, enabled, running);
+        add_interval(info, dtlb_read_misses, dtlb_read_accesses, itlb_read_misses, itlb_write_misses, enabled, running);
     }
 }
 
@@ -369,19 +400,19 @@ static int __init dtlb_miss_stats_init(void)
 
     printk(KERN_INFO "[TLB] module loading...\n");
 
-    memset(&dtlb_read_pea, 0, sizeof(dtlb_read_pea));
-    dtlb_read_pea.type = PERF_TYPE_HW_CACHE;
-    dtlb_read_pea.size = sizeof(struct perf_event_attr);
-    dtlb_read_pea.config = (PERF_COUNT_HW_CACHE_DTLB
+    memset(&dtlb_read_miss_pea, 0, sizeof(dtlb_read_miss_pea));
+    dtlb_read_miss_pea.type = PERF_TYPE_HW_CACHE;
+    dtlb_read_miss_pea.size = sizeof(struct perf_event_attr);
+    dtlb_read_miss_pea.config = (PERF_COUNT_HW_CACHE_DTLB
                             | (PERF_COUNT_HW_CACHE_OP_READ << 8)
                             | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16));
 
-    memset(&dtlb_write_pea, 0, sizeof(dtlb_write_pea));
-    dtlb_write_pea.type = PERF_TYPE_HW_CACHE;
-    dtlb_write_pea.size = sizeof(struct perf_event_attr);
-    dtlb_write_pea.config = (PERF_COUNT_HW_CACHE_DTLB
+    memset(&dtlb_read_access_pea, 0, sizeof(dtlb_read_access_pea));
+    dtlb_read_access_pea.type = PERF_TYPE_HW_CACHE;
+    dtlb_read_access_pea.size = sizeof(struct perf_event_attr);
+    dtlb_read_access_pea.config = (PERF_COUNT_HW_CACHE_DTLB
                              | (PERF_COUNT_HW_CACHE_OP_WRITE << 8)
-                             | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16));
+                             | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16));
 
     dtlb_proc_cache = kmem_cache_create("dtlb_proc_info",
                                         sizeof(struct dtlb_proc_info),
